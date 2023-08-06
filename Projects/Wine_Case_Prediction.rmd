@@ -1,0 +1,845 @@
+---
+title: 'Wine Case Prediction'
+author: "Eric Lehmphul"
+date: "5/14/2022"
+output: pdf_document
+---
+
+```{r, echo=F, warning=F, message=F}
+library(tidyverse)
+library(skimr)
+library(corrplot)
+library(caret)
+library(RANN)
+library(bnstruct)
+library(MASS)
+library(pscl)
+library(car)
+library(Metrics)
+```
+
+
+```{r,echo=FALSE}
+train.data <- read.csv("wine-training-data.csv")
+evaluation.data <-read.csv("wine-evaluation-data.csv")
+
+train.data <- train.data[,-1]
+```
+
+
+# Introduction 
+
+This assignment explores a data set containing information on
+approximately 12,000 commercially available wines. The objective of this assignment is to build a count regression model to predict the number of cases of wine that will be sold
+given certain properties of the wine.
+
+
+# DATA EXPLORATION
+
+## Summary Statistics
+
+The dataset contains multiple variables that are missing values. 8 out of the 15 variables contain missing values. Data imputation will be necessary to proceed to data modeling. 
+
+There also appears to be negative values that should not be possible. Such variables where this exists are: `FixedAcidity`, `VolatileAcidity`, `CitricAcid`, `ResidualSugar`, `Chlorides`, `FreeSulfurDioxide`, `TotalSulfurDioxide`, `Sulphates`, and `LabelAppeal`. In the data preprocessing section on unusual negative values, I will adjust them using both absolute value and the absolute value of the minimum value to guarantee that all values make sense. See data preprocessing section for more information. 
+
+```{r,echo=FALSE}
+summary(train.data)
+```
+
+
+
+## Variable Distributions
+
+Notable takaways from looking at the data distributions:
+* `STARS` and `LabelAppear` are categorical variables.
+* `AcidIndex` looks to follow a poisson distribution shape.
+* The following variables has a near normal distribution with high kurtosis: `Alcohol`, `Clorides`, `CitricAcid`, `Densitiy`, `FixedAcidity`, `FreeSulfurDioxide`, `pH`, `ResidualSugar`, `Sulphates`, `TotoalSulfurDioxide`, and `VolatileAcidiy`.
+```{r,echo=FALSE}
+train.data %>% 
+  gather(key = variable, value = value) %>%
+  ggplot(., aes(x = value)) +
+  geom_histogram(aes(x=value, y = ..density..), bins = 30, fill="#69b3a2", color="#e9ecef") +
+  geom_density(aes(x=value), color='red', lwd = 1.75) +
+  facet_wrap(~variable, scales ="free", ncol = 4) 
+```
+
+
+## Boxplots
+
+Most of the high kurtosis variables have an abundant amount of outliers, but none appear extreme outliers. Data transformations may not be necessary and outlier removal may not be necessary either.
+```{r,echo=FALSE}
+# Create Boxplots
+train.data %>% 
+  gather(key = variable, value = value) %>%
+  ggplot(., aes(x = value)) +
+  geom_boxplot(aes(x=variable, y = value)) +
+  facet_wrap(~variable, scales ="free", ncol = 4)
+```
+
+
+## Correlation Matrix to assess Mulicollinearity
+
+There does not seem to be any strongly correlated variables, meaning that multicolinearity is not very likely to occur in the data. 
+
+```{r,echo=FALSE}
+M <- cor(train.data, use = 'pairwise.complete.obs')
+corrplot(M, method = 'color', type = 'lower',col= colorRampPalette(c("#FF0000","#FDF6D0", "#0300FF"))(10), order = 'alphabet')
+```
+
+
+
+# DATA PREPARATION
+
+## Removed Unnecessary Variables
+
+The index variable was removed from the dataset as it provides no meaningful relation to the data.
+
+## Adjust Data Types
+
+I changed the data type of `STARS` to an ordered factor variable as it only have 4 values: '1', '2', '3', '4'. Least is 1 and most is 4.
+
+`LabelAppeal` was also changed into an ordered factor variable with the values: '-2', '-1', '0', '1', '2'.
+
+```{r,echo=FALSE}
+STARS <- c("1","2","3","4")
+train.data$STARS <- factor(train.data$STARS, levels = STARS, ordered = T) 
+
+LABEL <- c("-2","-1","0","1", "2")
+train.data$LabelAppeal <- factor(train.data$LabelAppeal, levels = LABEL, ordered = T) 
+```
+
+## Handle Missing Values
+
+To imputed the missing data I chose to implement KNN imputation for numeric data and imputed the categorical variable `STARS` using the logic that if there was n review, they did not enjoy the product. The numeric data was normalized after KNN imputation. I transformed the data back to its original form for modeling.
+```{r,echo=FALSE}
+preProcValues <- preProcess(train.data[,c("ResidualSugar", "Chlorides", "FreeSulfurDioxide", "TotalSulfurDioxide", "pH", "Sulphates", "Alcohol")],
+                            method = c("knnImpute"),
+                            k = 10,
+                            knnSummary = mean)
+
+imputed.train.data <- predict(preProcValues, train.data,na.action = na.pass)
+
+imputed.train.data$STARS[is.na(imputed.train.data$STARS)] <- "1"
+```
+
+
+
+```{r,echo=FALSE}
+procNames <- data.frame(col = names(preProcValues$mean), mean = preProcValues$mean, sd = preProcValues$std)
+for(i in procNames$col){
+ imputed.train.data[i] <- imputed.train.data[i]*preProcValues$std[i]+preProcValues$mean[i] 
+}
+```
+
+
+
+## Adjusting Invalid Negative Values
+
+I adjusted the strange negative values by  by shifting all variables to have a minimum value of 0. I accomplished this by adding the absolute value of the min to each row.
+
+```{r,echo=FALSE}
+imputed.train.data$FixedAcidity <- imputed.train.data$FixedAcidity + abs(min(imputed.train.data$FixedAcidity))
+
+imputed.train.data$VolatileAcidity <- imputed.train.data$VolatileAcidity + abs(min(imputed.train.data$VolatileAcidity))
+
+imputed.train.data$CitricAcid <- imputed.train.data$CitricAcid + abs(min(imputed.train.data$CitricAcid))
+
+imputed.train.data$ResidualSugar <- imputed.train.data$ResidualSugar + abs(min(imputed.train.data$ResidualSugar))
+
+imputed.train.data$Chlorides <- imputed.train.data$Chlorides + abs(min(imputed.train.data$Chlorides))
+
+imputed.train.data$FreeSulfurDioxide <- imputed.train.data$FreeSulfurDioxide + abs(min(imputed.train.data$FreeSulfurDioxide))
+
+imputed.train.data$TotalSulfurDioxide <- imputed.train.data$TotalSulfurDioxide + abs(min(imputed.train.data$TotalSulfurDioxide))
+
+imputed.train.data$Sulphates <- imputed.train.data$Sulphates + abs(min(imputed.train.data$Sulphates))
+```
+
+
+## New Data Distributions 
+
+```{r,echo=FALSE}
+imputed.train.data %>% 
+  gather(-c(STARS, LabelAppeal), key = variable, value = value) %>%
+  ggplot(., aes(x = value)) +
+  geom_histogram(aes(x=value, y = ..density..), bins = 30, fill="#69b3a2", color="#e9ecef") +
+  geom_density(aes(x=value), color='red', lwd = 1.75) +
+  facet_wrap(~variable, scales ="free", ncol = 4)
+```
+
+```{r,echo=FALSE}
+print("STARS:")
+summary(imputed.train.data$STARS)
+print("LabelAppeal")
+summary(imputed.train.data$LabelAppeal)
+```
+
+# BUILD MODELS
+
+## Create Train Test Split
+
+I will use a 70% training set and a 30% testing set for creating and evaluating models.
+
+```{r,echo=FALSE}
+set.seed(861)
+split <- sample(1:nrow(imputed.train.data), .6*nrow(imputed.train.data))
+
+train <- imputed.train.data[split,]
+test <- imputed.train.data[-split,]
+```
+
+
+## Model 1 - Poisson with all Variables
+
+```{r,echo=FALSE}
+m1 <- glm(TARGET ~ . , data=train, family="poisson")
+
+summary(m1)
+```
+
+### Multicollinearity Check
+
+```{r,echo=FALSE}
+vif(m1)
+```
+
+### Diagnostic Plots
+
+```{r,echo=FALSE}
+par(mfrow=c(2,2))
+
+plot(m1)
+```
+
+
+
+## Model 2 - Backward Selection Poisson
+
+```{r,echo=FALSE}
+all.variables <- glm(TARGET ~ . , data=train, family="poisson")
+
+m2 <- step(all.variables, direction = "backward", trace = 0)
+
+summary(m2)
+```
+
+### Multicollinearity Check
+
+```{r,echo=FALSE}
+vif(m2)
+```
+
+### Diagnostic Plots
+
+```{r,echo=FALSE}
+par(mfrow=c(2,2))
+
+plot(m2)
+```
+
+
+
+## Model 3 - Negative Binomial
+
+```{r,echo=FALSE, warning=F, message=F}
+m3 <- glm.nb(TARGET ~ . , data=train)
+
+summary(m3)
+```
+
+### Multicollinearity Check
+
+```{r,echo=FALSE}
+vif(m3)
+```
+
+### Diagnostic Plots
+
+```{r,echo=FALSE}
+par(mfrow=c(2,2))
+
+plot(m3)
+```
+
+
+## Model 4 - Backward Selecion Negative Binomial
+
+```{r,echo=FALSE, warning=F, message=F}
+all.variables <- glm.nb(TARGET ~ . , data=train)
+
+m4 <- step(all.variables, direction = "backward", trace = 0)
+
+summary(m4)
+```
+
+### Multicollinearity Check
+
+```{r,echo=FALSE}
+vif(m4)
+```
+
+### Diagnostic Plots
+
+```{r,echo=FALSE}
+par(mfrow=c(2,2))
+
+plot(m4)
+```
+
+
+## Model 5 - Linear Model
+
+```{r,echo=FALSE}
+m5 <- lm(TARGET~., data = train)
+
+
+summary(m5)
+```
+
+### Multicollinearity Check
+
+```{r,echo=FALSE}
+vif(m5)
+```
+
+### Diagnostic Plots
+
+```{r,echo=FALSE}
+par(mfrow=c(2,2))
+
+plot(m5)
+```
+
+## Model 6 - Backward Selection Linear Model
+
+
+```{r,echo=FALSE}
+all.variables <- lm(TARGET ~ . , data=train)
+
+m6 <- step(all.variables, direction = "backward", trace = 0)
+
+summary(m6)
+```
+
+### Multicollinearity Check
+
+```{r,echo=FALSE}
+vif(m6)
+```
+
+### Diagnostic Plots
+
+```{r,echo=FALSE}
+par(mfrow=c(2,2))
+
+plot(m6)
+```
+
+
+
+# SELECT MODELS
+
+## Identifying Best Model
+
+The table below summarizes each of the models performance through the metrics: AIC, BIC, RMSE, $R^2$, and MAE. The testing data set aside before modeling was used to evaluate model performance to simulate unknown data to the models. The best results are yielded by the linear regression models, but these models are unreliable due to underlying assumptions no being met: the underlying distribution is non-normal, the data is not continuous, and the model residuals appear to foolow a pattern. For this reason I will use the next best set of models for model evaluation. More specifically I will elect to use **Model 2 - Backward Selection Poisson** for predicting evaluation dataset. Model 2 had the highest AIC, BIC, RMSE, and MAE compared to valid / non-bias models. Model 2 was also about equal to other models $R^2$ values. 
+```{r,echo=FALSE}
+models <- c("Model 1 - Poisson.full","Model 2 - Poisson.reduced", "Model 3 - NegBinom.full", "Model 4 - NegBinom.reduced","Model 5 - Linear.full", "Model 6 - Linear.reduced")
+
+get_evaluation_metrics <- function(model){
+
+  # get predictions
+  predictions <- predict(model, newdata=test)
+  # store train and test TARGET variable in 
+  results <- data.frame(obs = test$TARGET, pred=predictions)
+  
+  # Get Metrics
+  AIC <- AIC(model)
+  BIC <- BIC(model)
+  RMSE <- rmse(test$TARGET, predictions)
+  Rsquared <- cor(test$TARGET, predictions)^2
+  MAE <- mae(test$TARGET,predictions)
+  
+  evaluation <- cbind(AIC,BIC,RMSE,Rsquared,MAE)
+  
+  return(evaluation)
+}
+
+
+
+
+
+model.evaluations <- rbind(get_evaluation_metrics(m1),
+get_evaluation_metrics(m2),
+get_evaluation_metrics(m3),
+get_evaluation_metrics(m4),
+get_evaluation_metrics(m5),
+get_evaluation_metrics(m6))
+
+rownames(model.evaluations) <- models
+
+kableExtra::kable(model.evaluations)
+```
+
+
+
+## Predictions on Evaluation Dataset using Model 2 - Backward Selection Poisson
+
+As explained above, Model 2 is likely to be the best at predicting outside data. The evaluation data underwent the same data preprocessing steps before generating model predictions. Below are the predictions to the evaluation data.
+
+```{r,echo=FALSE}
+# preprocess
+
+STARS <- c("1","2","3","4")
+evaluation.data$STARS <- factor(evaluation.data$STARS, levels = STARS, ordered = T) 
+
+LABEL <- c("-2","-1","0","1", "2")
+evaluation.data$LabelAppeal <- factor(evaluation.data$LabelAppeal, levels = LABEL, ordered = T) 
+
+
+preProcValues1 <- preProcess(evaluation.data[,c("ResidualSugar", "Chlorides", "FreeSulfurDioxide", "TotalSulfurDioxide", "pH", "Sulphates", "Alcohol")],
+                            method = c("knnImpute"),
+                            k = 10,
+                            knnSummary = mean)
+
+imputed.evaluation.data <- predict(preProcValues1, evaluation.data,na.action = na.pass)
+
+imputed.evaluation.data$STARS[is.na(imputed.evaluation.data$STARS)] <- "1"
+
+
+
+imputed.evaluation.data$FixedAcidity <- imputed.evaluation.data$FixedAcidity + abs(min(imputed.evaluation.data$FixedAcidity))
+
+imputed.evaluation.data$VolatileAcidity <- imputed.evaluation.data$VolatileAcidity + abs(min(imputed.evaluation.data$VolatileAcidity))
+
+imputed.evaluation.data$CitricAcid <- imputed.evaluation.data$CitricAcid + abs(min(imputed.evaluation.data$CitricAcid))
+
+imputed.evaluation.data$ResidualSugar <- imputed.evaluation.data$ResidualSugar + abs(min(imputed.evaluation.data$ResidualSugar))
+
+imputed.evaluation.data$Chlorides <- imputed.evaluation.data$Chlorides + abs(min(imputed.evaluation.data$Chlorides))
+
+imputed.evaluation.data$FreeSulfurDioxide <- imputed.evaluation.data$FreeSulfurDioxide + abs(min(imputed.evaluation.data$FreeSulfurDioxide))
+
+imputed.evaluation.data$TotalSulfurDioxide <- imputed.evaluation.data$TotalSulfurDioxide + abs(min(imputed.evaluation.data$TotalSulfurDioxide))
+
+imputed.evaluation.data$Sulphates <- imputed.evaluation.data$Sulphates + abs(min(imputed.evaluation.data$Sulphates))
+```
+
+
+```{r,echo=FALSE}
+predictions.evaluation <- predict(m2, newdata=imputed.evaluation.data)
+
+df.eval <- data.frame(prediction = predictions.evaluation,
+          count.predicted = round(predictions.evaluation,0))
+
+df.eval %>%
+  ggplot(aes(x=count.predicted)) +
+  geom_histogram() +
+  ggtitle("Distribution of Evaluation Predictions")
+```
+
+```{r,echo=FALSE}
+print("First 5 rows of predictions:")
+head(df.eval)
+```
+
+
+```{r,echo=FALSE}
+write.csv(df.eval, 'evaluation_predictions.csv', row.names=F)
+```
+
+
+
+# Appendix
+
+```{r,eval=FALSE}
+library(tidyverse)
+library(skimr)
+library(corrplot)
+library(caret)
+library(RANN)
+library(bnstruct)
+library(MASS)
+library(pscl)
+library(car)
+library(Metrics)
+
+train.data <- read.csv("wine-training-data.csv")
+evaluation.data <-read.csv("wine-evaluation-data.csv")
+
+train.data <- train.data[,-1]
+
+
+
+# Introduction 
+
+
+
+# DATA EXPLORATION
+
+## Summary Statistics
+
+
+summary(train.data)
+
+
+
+
+## Variable Distributions
+
+
+train.data %>% 
+  gather(key = variable, value = value) %>%
+  ggplot(., aes(x = value)) +
+  geom_histogram(aes(x=value, y = ..density..), bins = 30, fill="#69b3a2", color="#e9ecef") +
+  geom_density(aes(x=value), color='red', lwd = 1.75) +
+  facet_wrap(~variable, scales ="free", ncol = 4) 
+
+
+
+## Boxplots
+
+
+# Create Boxplots
+train.data %>% 
+  gather(key = variable, value = value) %>%
+  ggplot(., aes(x = value)) +
+  geom_boxplot(aes(x=variable, y = value)) +
+  facet_wrap(~variable, scales ="free", ncol = 4)
+
+
+
+## Correlation Matrix to assess Mulicollinearity
+
+
+M <- cor(train.data, use = 'pairwise.complete.obs')
+corrplot(M, method = 'color', type = 'lower',col= colorRampPalette(c("#FF0000","#FDF6D0", "#0300FF"))(10), order = 'alphabet')
+
+
+
+
+# DATA PREPARATION
+
+## Removed Unnecessary Variables
+
+
+
+STARS <- c("1","2","3","4")
+train.data$STARS <- factor(train.data$STARS, levels = STARS, ordered = T) 
+
+LABEL <- c("-2","-1","0","1", "2")
+train.data$LabelAppeal <- factor(train.data$LabelAppeal, levels = LABEL, ordered = T) 
+
+
+## Handle Missing Values
+
+preProcValues <- preProcess(train.data[,c("ResidualSugar", "Chlorides", "FreeSulfurDioxide", "TotalSulfurDioxide", "pH", "Sulphates", "Alcohol")],
+                            method = c("knnImpute"),
+                            k = 10,
+                            knnSummary = mean)
+
+imputed.train.data <- predict(preProcValues, train.data,na.action = na.pass)
+
+imputed.train.data$STARS[is.na(imputed.train.data$STARS)] <- "1"
+
+
+
+procNames <- data.frame(col = names(preProcValues$mean), mean = preProcValues$mean, sd = preProcValues$std)
+for(i in procNames$col){
+ imputed.train.data[i] <- imputed.train.data[i]*preProcValues$std[i]+preProcValues$mean[i] 
+}
+
+
+
+
+## Adjusting Invalid Negative Values
+
+
+imputed.train.data$FixedAcidity <- imputed.train.data$FixedAcidity + abs(min(imputed.train.data$FixedAcidity))
+
+imputed.train.data$VolatileAcidity <- imputed.train.data$VolatileAcidity + abs(min(imputed.train.data$VolatileAcidity))
+
+imputed.train.data$CitricAcid <- imputed.train.data$CitricAcid + abs(min(imputed.train.data$CitricAcid))
+
+imputed.train.data$ResidualSugar <- imputed.train.data$ResidualSugar + abs(min(imputed.train.data$ResidualSugar))
+
+imputed.train.data$Chlorides <- imputed.train.data$Chlorides + abs(min(imputed.train.data$Chlorides))
+
+imputed.train.data$FreeSulfurDioxide <- imputed.train.data$FreeSulfurDioxide + abs(min(imputed.train.data$FreeSulfurDioxide))
+
+imputed.train.data$TotalSulfurDioxide <- imputed.train.data$TotalSulfurDioxide + abs(min(imputed.train.data$TotalSulfurDioxide))
+
+imputed.train.data$Sulphates <- imputed.train.data$Sulphates + abs(min(imputed.train.data$Sulphates))
+
+
+
+## New Data Distributions 
+
+
+imputed.train.data %>% 
+  gather(-c(STARS, LabelAppeal), key = variable, value = value) %>%
+  ggplot(., aes(x = value)) +
+  geom_histogram(aes(x=value, y = ..density..), bins = 30, fill="#69b3a2", color="#e9ecef") +
+  geom_density(aes(x=value), color='red', lwd = 1.75) +
+  facet_wrap(~variable, scales ="free", ncol = 4)
+
+
+
+print("STARS:")
+summary(imputed.train.data$STARS)
+print("LabelAppeal")
+summary(imputed.train.data$LabelAppeal)
+
+
+# BUILD MODELS
+
+## Create Train Test Split
+
+
+
+set.seed(861)
+split <- sample(1:nrow(imputed.train.data), .6*nrow(imputed.train.data))
+
+train <- imputed.train.data[split,]
+test <- imputed.train.data[-split,]
+
+
+
+## Model 1 - Poisson with all Variables
+
+
+m1 <- glm(TARGET ~ . , data=train, family="poisson")
+
+summary(m1)
+
+
+### Multicollinearity Check
+
+
+vif(m1)
+
+
+### Diagnostic Plots
+
+
+par(mfrow=c(2,2))
+
+plot(m1)
+
+
+
+
+## Model 2 - Backward Selection Poisson
+
+
+all.variables <- glm(TARGET ~ . , data=train, family="poisson")
+
+m2 <- step(all.variables, direction = "backward", trace = 0)
+
+summary(m2)
+
+
+### Multicollinearity Check
+
+
+vif(m2)
+
+
+### Diagnostic Plots
+
+
+par(mfrow=c(2,2))
+
+plot(m2)
+
+
+
+
+## Model 3 - Negative Binomial
+
+
+m3 <- glm.nb(TARGET ~ . , data=train)
+
+summary(m3)
+
+
+### Multicollinearity Check
+
+
+vif(m3)
+
+
+### Diagnostic Plots
+
+
+par(mfrow=c(2,2))
+
+plot(m3)
+
+
+
+## Model 4 - Backward Selecion Negative Binomial
+
+
+all.variables <- glm.nb(TARGET ~ . , data=train)
+
+m4 <- step(all.variables, direction = "backward", trace = 0)
+
+summary(m4)
+
+
+### Multicollinearity Check
+
+
+vif(m4)
+
+
+### Diagnostic Plots
+
+
+par(mfrow=c(2,2))
+
+plot(m4)
+
+
+
+## Model 5 - Linear Model
+
+
+m5 <- lm(TARGET~., data = train)
+
+
+summary(m5)
+
+
+### Multicollinearity Check
+
+
+vif(m5)
+
+
+### Diagnostic Plots
+
+
+par(mfrow=c(2,2))
+
+plot(m5)
+
+
+## Model 6 - Backward Selection Linear Model
+
+
+
+all.variables <- lm(TARGET ~ . , data=train)
+
+m6 <- step(all.variables, direction = "backward", trace = 0)
+
+summary(m6)
+
+
+### Multicollinearity Check
+
+
+vif(m6)
+
+
+### Diagnostic Plots
+
+par(mfrow=c(2,2))
+
+plot(m6)
+
+
+
+
+# SELECT MODELS
+
+## Identifying Best Model
+
+
+models <- c("Model 1 - Poisson.full","Model 2 - Poisson.reduced", "Model 3 - NegBinom.full", "Model 4 - NegBinom.reduced","Model 5 - Linear.full", "Model 6 - Linear.reduced")
+
+get_evaluation_metrics <- function(model){
+
+  # get predictions
+  predictions <- predict(model, newdata=test)
+  # store train and test TARGET variable in 
+  results <- data.frame(obs = test$TARGET, pred=predictions)
+  
+  # Get Metrics
+  AIC <- AIC(model)
+  BIC <- BIC(model)
+  RMSE <- rmse(test$TARGET, predictions)
+  Rsquared <- cor(test$TARGET, predictions)^2
+  MAE <- mae(test$TARGET,predictions)
+  
+  evaluation <- cbind(AIC,BIC,RMSE,Rsquared,MAE)
+  
+  return(evaluation)
+}
+
+
+
+
+
+model.evaluations <- rbind(get_evaluation_metrics(m1),
+get_evaluation_metrics(m2),
+get_evaluation_metrics(m3),
+get_evaluation_metrics(m4),
+get_evaluation_metrics(m5),
+get_evaluation_metrics(m6))
+
+rownames(model.evaluations) <- models
+
+kableExtra::kable(model.evaluations)
+
+# preprocess
+
+STARS <- c("1","2","3","4")
+evaluation.data$STARS <- factor(evaluation.data$STARS, levels = STARS, ordered = T) 
+
+LABEL <- c("-2","-1","0","1", "2")
+evaluation.data$LabelAppeal <- factor(evaluation.data$LabelAppeal, levels = LABEL, ordered = T) 
+
+
+preProcValues1 <- preProcess(evaluation.data[,c("ResidualSugar", "Chlorides", "FreeSulfurDioxide", "TotalSulfurDioxide", "pH", "Sulphates", "Alcohol")],
+                            method = c("knnImpute"),
+                            k = 10,
+                            knnSummary = mean)
+
+imputed.evaluation.data <- predict(preProcValues1, evaluation.data,na.action = na.pass)
+
+imputed.evaluation.data$STARS[is.na(imputed.evaluation.data$STARS)] <- "1"
+
+
+
+imputed.evaluation.data$FixedAcidity <- imputed.evaluation.data$FixedAcidity + abs(min(imputed.evaluation.data$FixedAcidity))
+
+imputed.evaluation.data$VolatileAcidity <- imputed.evaluation.data$VolatileAcidity + abs(min(imputed.evaluation.data$VolatileAcidity))
+
+imputed.evaluation.data$CitricAcid <- imputed.evaluation.data$CitricAcid + abs(min(imputed.evaluation.data$CitricAcid))
+
+imputed.evaluation.data$ResidualSugar <- imputed.evaluation.data$ResidualSugar + abs(min(imputed.evaluation.data$ResidualSugar))
+
+imputed.evaluation.data$Chlorides <- imputed.evaluation.data$Chlorides + abs(min(imputed.evaluation.data$Chlorides))
+
+imputed.evaluation.data$FreeSulfurDioxide <- imputed.evaluation.data$FreeSulfurDioxide + abs(min(imputed.evaluation.data$FreeSulfurDioxide))
+
+imputed.evaluation.data$TotalSulfurDioxide <- imputed.evaluation.data$TotalSulfurDioxide + abs(min(imputed.evaluation.data$TotalSulfurDioxide))
+
+imputed.evaluation.data$Sulphates <- imputed.evaluation.data$Sulphates + abs(min(imputed.evaluation.data$Sulphates))
+
+predictions.evaluation <- predict(m2, newdata=imputed.evaluation.data)
+
+df.eval <- data.frame(prediction = predictions.evaluation,
+          count.predicted = round(predictions.evaluation,0))
+
+df.eval %>%
+  ggplot(aes(x=count.predicted)) +
+  geom_histogram() +
+  ggtitle("Distribution of Evaluation Predictions")
+
+print("First 5 rows of predictions:")
+head(df.eval)
+
+write.csv(clean_eval_df, 'evaluation_predictions.csv', row.names=F)
+```
